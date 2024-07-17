@@ -8,10 +8,109 @@ from omegaconf import DictConfig
 import wandb
 from termcolor import cprint
 from tqdm import tqdm
+import torch.nn as nn
+from einops.layers.torch import Rearrange
+import torchaudio
 
-from src.datasets import ThingsMEGDataset
-from src.models import BasicConvClassifier
+
+
 from src.utils import set_seed
+
+class ThingsMEGDataset(torch.utils.data.Dataset):
+    def __init__(self, split: str, data_dir: str = "data") -> None:
+        super().__init__()
+
+        assert split in ["train", "val", "test"], f"Invalid split: {split}"
+        self.split = split
+        self.num_classes = 1854
+
+
+        self.X = torch.load(os.path.join(data_dir, f"{split}_X.pt"))
+        self.subject_idxs = torch.load(os.path.join(data_dir, f"{split}_subject_idxs.pt"))
+
+        self.mulawencoding = torchaudio.transforms.MuLawEncoding()
+        self.resample = torchaudio.transforms.Resample(200, 120, dtype=torch.float)
+
+        if split in ["train", "val"]:
+            self.y = torch.load(os.path.join(data_dir, f"{split}_y.pt"))
+            assert len(torch.unique(self.y)) == self.num_classes, "Number of classes do not match."
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def transform(self, X):
+        X = self.resample(X)
+        X = self.mulawencoding(X)
+        X = X / torch.max(X[:, :10], dim=1, keepdim=True)[0]
+        return X
+
+    def __getitem__(self, i):
+        X = self.transform(self.X[i])
+        if hasattr(self, "y"):
+            return X, self.y[i], self.subject_idxs[i]
+        else:
+            return X, self.subject_idxs[i]
+
+    @property
+    def num_channels(self) -> int:
+        return self.X.shape[1]
+
+    @property
+    def seq_len(self) -> int:
+        return self.X.shape[2]
+    
+class EEGNet(nn.Module):
+    def __init__(self, num_classes: int, seq_len: int, in_channels: int, hid_dim: int = 128,):
+        super(EEGNet, self).__init__()
+        self.T = 120
+        self.seq_len = seq_len
+        self.F1 = 16
+        self.F2 = 16
+        self.D = 2
+        # Layer 1
+        self.conv1 = nn.Conv2d(1, self.F1, (in_channels, 1), padding = 0)
+        self.batchnorm1 = nn.BatchNorm2d(self.F1, False)
+
+        # Layer 2
+        self.conv2 = nn.Conv2d(1 , 4, (2, 32), padding="same")
+        self.batchnorm2 = nn.BatchNorm2d(4, False)
+        self.pooling2 = nn.MaxPool2d(2, 4)
+
+        # Layer 3
+        self.conv3 = nn.Conv2d(4, 4, (8, 4), padding="same")
+        self.batchnorm3 = nn.BatchNorm2d(4, False)
+        self.pooling3 = nn.MaxPool2d((2, 4))
+
+        # FC Layer
+        # NOTE: This dimension will depend on the number of timestamps per sample in your data.
+        # I have 120 timepoints.
+        self.fc1 = nn.Linear(80, num_classes)
+
+    def forward(self, x):
+        # Layer 1
+        x = x.unsqueeze(1)
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+        x = F.dropout(x, 0.25)
+        x = x.permute(0, 2, 1, 3)
+
+
+        # Layer 2
+        x = F.elu(self.conv2(x))
+        x = self.batchnorm2(x)
+        x = self.pooling2(x)
+        x = F.dropout(x, 0.25)
+        # Layer 3
+        x = F.elu(self.conv3(x))
+        x = self.batchnorm3(x)
+        x = F.dropout(x, 0.25)
+        x = self.pooling3(x)
+        # FC Layer
+        x = x.view(x.size(0), -1)
+        x = self.fc1(x)
+        return x
+
+
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -39,7 +138,7 @@ def run(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
-    model = BasicConvClassifier(
+    model = EEGNet(
         train_set.num_classes, train_set.seq_len, train_set.num_channels
     ).to(args.device)
 
